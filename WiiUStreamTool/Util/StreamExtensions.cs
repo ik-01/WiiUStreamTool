@@ -1,4 +1,7 @@
-﻿namespace WiiUStreamTool.Util;
+﻿using System;
+using System.IO;
+
+namespace WiiUStreamTool.Util;
 
 public static class StreamExtensions {
     public static int WriteAndHash(this Stream stream, Span<byte> data, ref uint hash) {

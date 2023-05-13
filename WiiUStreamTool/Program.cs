@@ -1,4 +1,9 @@
-﻿using System.CommandLine;
+﻿using System;
+using System.CommandLine;
+using System.CommandLine.Invocation;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using WiiUStreamTool.FileFormat;
 using WiiUStreamTool.Util;
 
@@ -26,30 +31,45 @@ public static class Program {
         preservePbxmlOption.AddAlias("-p");
         command.AddOption(preservePbxmlOption);
 
-        command.SetHandler(context => {
-            var path = context.ParseResult.GetValueForArgument(pathArgument);
-            var outPath = context.ParseResult.GetValueForOption(outPathOption);
-            var preservePbxml = context.ParseResult.GetValueForOption(preservePbxmlOption);
-            var overwrite = context.ParseResult.GetValueForOption(overwriteOption);
-            
-            using var f = File.OpenRead(path);
-            outPath ??= Path.Combine(
-                Path.GetDirectoryName(path) ?? Environment.CurrentDirectory,
-                Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(path)));
-            WiiUStream.Extract(
-                f,
-                outPath,
-                preservePbxml,
-                overwrite,
-                (ref WiiUStream.FileEntryHeader fe, long progress, long max, bool skipped) => Console.WriteLine(
-                    "[{0:00.00}%] {1} ({2:##,###} bytes){3}",
-                    100.0 * progress / max,
-                    fe.InnerPath,
-                    fe.DecompressedSize,
-                    skipped ? " [SKIPPED]" : ""));
-            Console.WriteLine("Done!");
-            return Task.FromResult(0);
-        });
+        async Task<int> Handler(InvocationContext context) {
+            try {
+                var path = context.ParseResult.GetValueForArgument(pathArgument);
+                var outPath = context.ParseResult.GetValueForOption(outPathOption);
+                var preservePbxml = context.ParseResult.GetValueForOption(preservePbxmlOption);
+                var overwrite = context.ParseResult.GetValueForOption(overwriteOption);
+
+                await using var f = File.OpenRead(path);
+                outPath ??= Path.Combine(
+                    Path.GetDirectoryName(path) ?? Environment.CurrentDirectory,
+                    Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(path)));
+                await WiiUStream.Extract(
+                    f,
+                    outPath,
+                    preservePbxml,
+                    overwrite,
+                    (ref WiiUStream.FileEntryHeader fe, long progress, long max, bool skipped, bool complete) => {
+                        if (complete) {
+                            Console.Write(
+                                "[{0:00.00}%] {1} ({2:##,###} bytes){3}... ",
+                                100.0 * progress / max,
+                                fe.InnerPath,
+                                fe.DecompressedSize,
+                                skipped ? " [SKIPPED]" : "");
+                        } else {
+                            Console.WriteLine(" done!");
+                        }
+                    },
+                    context.GetCancellationToken());
+                Console.WriteLine("Done!");
+                return 0;
+            } catch (OperationCanceledException) {
+                using (ScopedConsoleColor.Foreground(ConsoleColor.Yellow))
+                    Console.WriteLine("Cancelled per user request.");
+                return -1;
+            }
+        }
+
+        command.SetHandler(Handler);
 
         parentCommand.AddCommand(command);
         return command;
@@ -76,55 +96,93 @@ public static class Program {
         preserveXmlOption.AddAlias("-p");
         command.AddOption(preserveXmlOption);
 
+        const int compressionLevelDefault = 8;
         var compressionLevelOption = new Option<int>(
             "--compression-level",
-            () => 8,
-            "Specify the effort for compressing files. Use 0 to disable compression. Time taken scales linearly.");
+            () => -1,
+            "Specify the effort for compressing files.\n" +
+            $"Use -1 to use {compressionLevelDefault} if chunking is disabled, and otherwise, use chunk size.\n" +
+            "Use 0 to disable compression.");
         compressionLevelOption.AddAlias("-l");
         command.AddOption(compressionLevelOption);
 
-        command.SetHandler(context => {
+        var compressionChunkSizeOption = new Option<int>(
+            "--compression-chunk-size",
+            () => 24576,
+            "Specify the compression block size. Use 0 to disable chunking.");
+        compressionChunkSizeOption.AddAlias("-c");
+        command.AddOption(compressionChunkSizeOption);
+
+        async Task<int> Handler(InvocationContext context) {
             var path = context.ParseResult.GetValueForArgument(pathArgument);
             var outPath = context.ParseResult.GetValueForOption(outPathOption);
             var preserveXml = context.ParseResult.GetValueForOption(preserveXmlOption);
             var compressionLevel = context.ParseResult.GetValueForOption(compressionLevelOption);
+            var compressionChunkSize = context.ParseResult.GetValueForOption(compressionChunkSizeOption);
             var overwrite = context.ParseResult.GetValueForOption(overwriteOption);
-            
+
             outPath ??= Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".wiiu.stream");
             if (!overwrite && Path.Exists(outPath)) {
                 Console.Error.WriteLine("File {0} already exists; aborting. Use -y to overwrite.", outPath);
-                return Task.FromResult(-1);
+                return -1;
+            }
+
+            void CompressProgress(int progress, int max, ref WiiUStream.FileEntryHeader header) {
+                if (header.DecompressedSize == 0) {
+                    Console.Write(
+                        "[{0:00.00}%] {1}... ",
+                        100.0 * progress / max,
+                        header.InnerPath);
+                } else if (header.CompressedSize == 0) {
+                    Console.WriteLine("not compressed");
+                } else {
+                    Console.WriteLine(
+                        "{0:##,###} bytes to {1:##,###} bytes ({2:00.00}%)",
+                        header.DecompressedSize,
+                        header.CompressedSize,
+                        100.0 * header.CompressedSize / header.DecompressedSize);
+                }
             }
 
             var tmpPath = $"{outPath}.tmp{Environment.TickCount64:X}";
             try {
-                using (var stream = new FileStream(tmpPath, FileMode.Create))
-                    WiiUStream.Compress(
+                await using (var stream = new FileStream(tmpPath, FileMode.Create))
+                    await WiiUStream.Compress(
                         path,
                         stream,
                         preserveXml,
-                        compressionLevel,
-                        (s, progress, max) => Console.WriteLine(
-                            "[{0:00.00}%] {1}",
-                            100.0 * progress / max,
-                            s));
+                        compressionLevel == -1
+                            ? compressionChunkSize == 0 ? compressionLevelDefault : compressionChunkSize
+                            : compressionLevel,
+                        compressionChunkSize,
+                        CompressProgress,
+                        context.GetCancellationToken());
 
                 if (File.Exists(outPath))
                     File.Replace(tmpPath, outPath, null);
                 else
                     File.Move(tmpPath, outPath);
+
                 Console.WriteLine("Done!");
-                return Task.FromResult(0);
-            } catch (Exception) {
+                return 0;
+            } catch (Exception e) {
                 try {
                     File.Delete(tmpPath);
                 } catch (Exception) {
                     // swallow
                 }
 
+                if (e is OperationCanceledException) {
+                    using (ScopedConsoleColor.Foreground(ConsoleColor.Yellow))
+                        Console.WriteLine("Cancelled per user request.");
+                    return -1;
+                }
+
                 throw;
             }
-        });
+        }
+
+        command.SetHandler(Handler);
 
         parentCommand.AddCommand(command);
         return command;
@@ -151,7 +209,6 @@ public static class Program {
                         Console.WriteLine("Assuming {0} with default options.", compressCommand.Name);
                     args = new[] {compressCommand.Name, args[0]};
                 }
-                
             } else if (File.Exists(args[0])) {
                 Span<byte> peekResult = stackalloc byte[Math.Max(WiiUStream.Magic.Length, Pbxml.Magic.Length)];
                 using (var peeker = File.OpenRead(args[0]))
@@ -164,7 +221,7 @@ public static class Program {
                 }
             }
         }
-        
+
         return cmd.InvokeAsync(args);
     }
 }

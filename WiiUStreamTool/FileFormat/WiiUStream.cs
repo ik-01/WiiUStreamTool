@@ -1,5 +1,12 @@
-﻿using System.Collections.Immutable;
+﻿using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.ObjectPool;
 using WiiUStreamTool.Util;
 
 namespace WiiUStreamTool.FileFormat;
@@ -8,19 +15,20 @@ public static class WiiUStream {
     public const string MetadataFilename = "_WiiUStreamMetadata.txt";
     public static readonly ImmutableArray<byte> Magic = "strm"u8.ToArray().ToImmutableArray();
 
-    public static void Extract(
+    public static async Task Extract(
         Stream stream,
         string basePath,
         bool preservePbxml,
         bool overwrite,
-        ExtractProgress? progress) {
+        ExtractProgress? progress,
+        CancellationToken cancellationToken) {
         using var reader = new NativeReader(stream, Encoding.UTF8, true) {IsBigEndian = true};
 
         if (!Magic.SequenceEqual(reader.ReadBytes(4)))
             throw new InvalidDataException("Given file does not have the correct magic value.");
 
         Directory.CreateDirectory(basePath);
-        using var metadata = new StreamWriter(
+        await using var metadata = new StreamWriter(
             Path.Combine(basePath, MetadataFilename),
             false,
             new UTF8Encoding());
@@ -28,38 +36,42 @@ public static class WiiUStream {
         using var ms = new MemoryStream();
         using var msr = new NativeReader(ms);
         while (reader.BaseStream.Position < reader.BaseStream.Length) {
+            cancellationToken.ThrowIfCancellationRequested();
+            
             var fe = FileEntryHeader.FromReader(reader, basePath);
-            metadata.WriteLine(fe.ToLine());
+            await metadata.WriteLineAsync(fe.ToLine());
 
             if (!overwrite && Path.Exists(fe.LocalPath)) {
                 reader.BaseStream.Position += fe.CompressedSize == 0 ? fe.DecompressedSize : fe.CompressedSize;
-                progress?.Invoke(ref fe, reader.BaseStream.Position, reader.BaseStream.Length, true);
+                progress?.Invoke(ref fe, reader.BaseStream.Position, reader.BaseStream.Length, true, true);
                 continue;
             }
 
-            progress?.Invoke(ref fe, reader.BaseStream.Position, reader.BaseStream.Length, false);
+            progress?.Invoke(ref fe, reader.BaseStream.Position, reader.BaseStream.Length, false, false);
 
-            msr.BaseStream.SetLength(fe.DecompressedSize);
-            msr.BaseStream.Position = 0;
-            DecompressOne(reader.BaseStream, msr.BaseStream, fe.DecompressedSize, fe.CompressedSize);
+            ms.SetLength(fe.DecompressedSize);
+            ms.Position = 0;
+            DecompressOne(reader.BaseStream, ms, fe.DecompressedSize, fe.CompressedSize);
 
             Directory.CreateDirectory(Path.GetDirectoryName(fe.LocalPath)!);
             var tempPath = $"{fe.LocalPath}.tmp{Environment.TickCount64:X}";
             try {
-                using (var target = new FileStream(tempPath, FileMode.Create)) {
+                await using (var target = new FileStream(tempPath, FileMode.Create)) {
                     msr.BaseStream.Position = 0;
                     if (!preservePbxml &&
                         ms.Length >= Pbxml.Magic.Length &&
                         ms.GetBuffer().AsSpan().CommonPrefixLength(Pbxml.Magic.AsSpan()) == Pbxml.Magic.Length)
                         Pbxml.Unpack(msr, new(target, new UTF8Encoding()));
                     else
-                        msr.BaseStream.CopyTo(target);
+                        await target.WriteAsync(ms.GetBuffer().AsMemory(0, (int)ms.Length), cancellationToken);
                 }
 
                 if (Path.Exists(fe.LocalPath))
                     File.Replace(tempPath, fe.LocalPath, null);
                 else
                     File.Move(tempPath, fe.LocalPath);
+                
+                progress?.Invoke(ref fe, reader.BaseStream.Position, reader.BaseStream.Length, false, true);
             } catch (Exception) {
                 try {
                     File.Delete(tempPath);
@@ -72,17 +84,19 @@ public static class WiiUStream {
         }
     }
 
-    public static void Compress(
+    public static async Task Compress(
         string basePath,
         Stream target,
         bool preserveXml,
         int compressionLevel,
-        CompressProgress progress) {
+        int compressionChunkSize,
+        CompressProgress progress,
+        CancellationToken cancellationToken) {
         FileEntryHeader[] files;
         using (var s = new StreamReader(File.OpenRead(Path.Combine(basePath, MetadataFilename)))) {
             var filesList = new List<FileEntryHeader>();
             while (true) {
-                var l = s.ReadLine();
+                var l = await s.ReadLineAsync(cancellationToken);
                 if (string.IsNullOrEmpty(l))
                     break;
                 filesList.Add(FileEntryHeader.FromLine(l, basePath));
@@ -91,68 +105,118 @@ public static class WiiUStream {
             files = filesList.ToArray();
         }
 
-        using var writer = new NativeWriter(target, Encoding.UTF8) {IsBigEndian = true};
+        await using var writer = new NativeWriter(target, Encoding.UTF8) {IsBigEndian = true};
         writer.Write(Magic.AsSpan());
 
-        using var sourceBuffer = new MemoryStream();
+        using var rawStream = new MemoryStream();
         using var compressionBuffer = new MemoryStream();
-        using var compressionBufferWriter = new BinaryWriter(compressionBuffer);
+        await using var compressionBufferWriter = new BinaryWriter(compressionBuffer);
         for (var i = 0; i < files.Length; i++) {
-            progress(files[i].InnerPath, i, files.Length);
+            progress(i, files.Length, ref files[i]);
 
-            using (var f = new FileStream(files[i].LocalPath, FileMode.Open, FileAccess.Read)) {
-                sourceBuffer.SetLength(f.Length);
-                sourceBuffer.Position = 0;
-                f.CopyTo(sourceBuffer);
+            await using (var f = new FileStream(files[i].LocalPath, FileMode.Open, FileAccess.Read)) {
+                rawStream.SetLength(f.Length);
+                rawStream.Position = 0;
+                await f.CopyToAsync(rawStream, cancellationToken);
             }
 
-            var sourceSpan = sourceBuffer.GetBuffer().AsSpan(0, (int) sourceBuffer.Length);
+            var raw = rawStream.GetBuffer().AsMemory(0, checked((int) rawStream.Length));
 
-            if (!preserveXml && sourceSpan.StartsWith("<?xml"u8)) {
+            if (!preserveXml && raw.StartsWith("<?xml"u8)) {
                 compressionBuffer.SetLength(0);
                 compressionBuffer.Position = 0;
-                sourceBuffer.Position = 0;
-                Pbxml.Pack(sourceBuffer, compressionBufferWriter);
-                sourceBuffer.SetLength(compressionBuffer.Length);
-                sourceBuffer.Position = 0;
+                rawStream.Position = 0;
+                Pbxml.Pack(rawStream, compressionBufferWriter);
+                rawStream.SetLength(compressionBuffer.Length);
+                rawStream.Position = 0;
                 compressionBuffer.Position = 0;
-                compressionBuffer.CopyTo(sourceBuffer);
+                await compressionBuffer.CopyToAsync(rawStream, cancellationToken);
             }
 
-            var compressedSize = 0;
-            var crc32 = 0u;
             if (compressionLevel > 0) {
                 compressionBuffer.SetLength(0);
                 compressionBuffer.Position = 0;
-                CompressOne(sourceSpan, compressionBuffer, compressionLevel, out compressedSize, out crc32);
+                await CompressOne(raw, compressionBuffer, compressionLevel, compressionChunkSize, cancellationToken);
                 compressionBuffer.Position = 0;
             }
 
-            var discardCompression = compressionLevel <= 0 || compressedSize >= sourceSpan.Length;
+            var compressedSize = compressionLevel > 0 ? checked((int) compressionBuffer.Length) : 0;
+            var discardCompression = compressionLevel <= 0 || compressedSize >= raw.Length;
 
             files[i].CompressedSize = discardCompression ? 0 : compressedSize;
-            files[i].DecompressedSize = sourceSpan.Length;
-            files[i].Hash = discardCompression ? Crc32.Get(sourceSpan) : crc32;
+            files[i].DecompressedSize = raw.Length;
+            files[i].Hash = discardCompression
+                ? Crc32.Get(raw.Span)
+                : Crc32.Get(compressionBuffer.GetBuffer(), 0, compressedSize);
             files[i].WriteTo(writer);
-            if (discardCompression)
-                writer.Write(sourceSpan);
-            else
-                compressionBuffer.CopyTo(writer.BaseStream);
+            await writer.BaseStream.WriteAsync(
+                discardCompression ? raw : compressionBuffer.GetBuffer().AsMemory(0, compressedSize),
+                cancellationToken);
+            progress(i, files.Length, ref files[i]);
         }
     }
 
-    public static void CompressOne(Span<byte> source, Stream target, int level, out int written, out uint crc32) {
+    public static async Task CompressOne(
+        Memory<byte> raw,
+        Stream target,
+        int level,
+        int chunkSize,
+        CancellationToken cancellationToken) {
+
+        // Is chunking disabled, or is the file small enough that there is no point in multithreading?
+        if (chunkSize <= 0 || raw.Length <= chunkSize) {
+            CompressChunk(raw.Span, target, level, cancellationToken);
+            return;
+        }
+        
+        var pool = ObjectPool.Create(new DefaultPooledObjectPolicy<MemoryStream>());
+
+        Task<MemoryStream> DoChunk(int offset, int length) => Task.Run(() => {
+            var ms = pool.Get();
+            ms.SetLength(ms.Position = 0);
+            CompressChunk(raw.Span.Slice(offset, length), ms, level, cancellationToken);
+            return ms;
+        }, cancellationToken);
+
+        var concurrency = Environment.ProcessorCount;
+        var tasks = new List<Task<MemoryStream>>(Math.Min((raw.Length + chunkSize - 1) / chunkSize, concurrency));
+
+        var runningTasks = new HashSet<Task<MemoryStream>>();
+        for (var i = 0; i < raw.Length; i += chunkSize) {
+            if (runningTasks.Count >= concurrency) {
+                await Task.WhenAny(runningTasks);
+                runningTasks.RemoveWhere(x => x.IsCompleted);
+            }
+
+            while (tasks.FirstOrDefault()?.IsCompleted is true) {
+                var result = tasks[0].Result;
+                tasks.RemoveAt(0);
+                result.Position = 0;
+                await result.CopyToAsync(target, cancellationToken);
+            }
+
+            tasks.Add(DoChunk(i, Math.Min(chunkSize, raw.Length - i)));
+            runningTasks.Add(tasks.Last());
+        }
+
+        foreach (var task in tasks) {
+            var result = await task;
+            result.Position = 0;
+            await result.CopyToAsync(target, cancellationToken);
+        }
+    }
+
+    public static void CompressChunk(Span<byte> source, Stream target, int level, CancellationToken cancellationToken) {
         var asisBegin = 0;
         var asisLen = 0;
 
-        var totalWritten = 0;
-        var hash = Crc32.Get(Span<byte>.Empty);
-        Span<byte> cryIntBuf = stackalloc byte[5];
         Span<int> lastByteIndex = stackalloc int[0x100];
         lastByteIndex.Fill(-1);
         var prevSameByteIndex = new int[source.Length];
 
         for (var i = 0; i < source.Length;) {
+            cancellationToken.ThrowIfCancellationRequested();
+            
             var lookbackOffset = 1;
             var maxRepeatedSequenceLength = 0;
 
@@ -182,20 +246,12 @@ public static class WiiUStream {
                 CryBinaryPrimitives.CountCryIntBytes(maxRepeatedSequenceLength - 3, true) +
                 CryBinaryPrimitives.CountCryIntBytes(lookbackOffset, false)) {
                 if (asisLen != 0) {
-                    totalWritten += target.WriteAndHash(
-                        cryIntBuf.WriteCryIntWithFlag(asisLen, false),
-                        ref hash);
-                    totalWritten += target.WriteAndHash(
-                        source.Slice(asisBegin, asisLen),
-                        ref hash);
+                    target.WriteCryIntWithFlag(asisLen, false);
+                    target.Write(source.Slice(asisBegin, asisLen));
                 }
 
-                totalWritten += target.WriteAndHash(
-                    cryIntBuf.WriteCryIntWithFlag(maxRepeatedSequenceLength - 3, true),
-                    ref hash);
-                totalWritten += target.WriteAndHash(
-                    cryIntBuf.WriteCryInt(lookbackOffset),
-                    ref hash);
+                target.WriteCryIntWithFlag(maxRepeatedSequenceLength - 3, true);
+                target.WriteCryInt(lookbackOffset);
 
                 while (maxRepeatedSequenceLength-- > 0) {
                     prevSameByteIndex[i] = lastByteIndex[source[i]];
@@ -216,12 +272,9 @@ public static class WiiUStream {
         }
 
         if (asisLen != 0) {
-            totalWritten += target.WriteAndHash(cryIntBuf.WriteCryIntWithFlag(asisLen, false), ref hash);
-            totalWritten += target.WriteAndHash(source.Slice(asisBegin, asisLen), ref hash);
+            target.WriteCryIntWithFlag(asisLen, false);
+            target.Write(source.Slice(asisBegin, asisLen));
         }
-
-        crc32 = hash;
-        written = totalWritten;
     }
 
     public static void DecompressOne(Stream source, Stream target, int decompressedSize, int compressedSize) {
@@ -300,7 +353,12 @@ public static class WiiUStream {
         }
     }
 
-    public delegate void ExtractProgress(ref FileEntryHeader fe, long progress, long max, bool overwriteSkipped);
+    public delegate void ExtractProgress(
+        ref FileEntryHeader fe,
+        long progress,
+        long max,
+        bool overwriteSkipped,
+        bool complete);
 
-    public delegate void CompressProgress(string path, int progress, int max);
+    public delegate void CompressProgress(int progress, int max, ref FileEntryHeader header);
 }

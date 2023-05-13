@@ -1,4 +1,6 @@
-﻿namespace WiiUStreamTool.Util;
+﻿using System;
+
+namespace WiiUStreamTool.Util;
 
 public sealed class ScopedConsoleColor : IDisposable {
     public readonly ConsoleColor? PreviousForeground;

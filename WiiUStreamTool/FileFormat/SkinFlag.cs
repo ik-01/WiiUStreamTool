@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace WiiUStreamTool.FileFormat;
 
 public enum SkinFlag : short {
