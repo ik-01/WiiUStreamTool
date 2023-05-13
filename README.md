@@ -1,4 +1,4 @@
-# WiiUStreamTool (WIP)
+# WiiUStreamTool
 
 Tool for extracting and repacking Sonic Boom: Rise of Lyric wiiu.stream archives
 
