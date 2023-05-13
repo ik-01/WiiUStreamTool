@@ -189,7 +189,7 @@ public static class Program {
     }
 
     public static Task<int> Main(string[] args) {
-        var cmd = new RootCommand("Extracts a .wiiu.stream archive, or compress into one.");
+        var cmd = new RootCommand("Tool for extracting and repacking Sonic Boom: Rise of Lyric wiiu.stream archives.\nGithub: https://github.com/ik-01/WiiUStreamTool");
 
         var overwriteOption = new Option<bool>(
             "--overwrite",
