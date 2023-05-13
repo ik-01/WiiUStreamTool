@@ -1,6 +1,4 @@
-﻿using System.Buffers;
-
-namespace WiiUStreamTool.Util;
+﻿namespace WiiUStreamTool.Util;
 
 public static class StreamExtensions {
     public static int WriteAndHash(this Stream stream, Span<byte> data, ref uint hash) {
@@ -15,17 +13,13 @@ public static class StreamExtensions {
     };
 
     public static void CopyToLength(this Stream source, Stream destination, int length) {
-        var buffer = ArrayPool<byte>.Shared.Rent(4096);
-        try {
-            while (length > 0) {
-                var chunk = source.Read(buffer, 0, Math.Min(buffer.Length, length));
-                if (chunk == 0)
-                    throw new EndOfStreamException();
-                destination.Write(buffer, 0, chunk);
-                length -= chunk;
-            }
-        } finally {
-            ArrayPool<byte>.Shared.Return(buffer);
+        Span<byte> buffer = stackalloc byte[4096];
+        while (length > 0) {
+            var chunk = source.Read(buffer[..Math.Min(buffer.Length, length)]);
+            if (chunk == 0)
+                throw new EndOfStreamException();
+            destination.Write(buffer[..chunk]);
+            length -= chunk;
         }
     }
 }

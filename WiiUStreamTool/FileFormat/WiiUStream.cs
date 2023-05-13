@@ -1,5 +1,4 @@
-﻿using System.Buffers;
-using System.Collections.Immutable;
+﻿using System.Collections.Immutable;
 using System.Text;
 using WiiUStreamTool.Util;
 
@@ -148,81 +147,77 @@ public static class WiiUStream {
 
         var totalWritten = 0;
         var hash = Crc32.Get(Span<byte>.Empty);
-        var cryIntBuf = ArrayPool<byte>.Shared.Rent(5);
-        try {
-            Span<int> lastByteIndex = stackalloc int[0x100];
-            lastByteIndex.Fill(-1);
-            var prevSameByteIndex = new int[source.Length];
+        Span<byte> cryIntBuf = stackalloc byte[5];
+        Span<int> lastByteIndex = stackalloc int[0x100];
+        lastByteIndex.Fill(-1);
+        var prevSameByteIndex = new int[source.Length];
 
-            for (var i = 0; i < source.Length;) {
-                var lookbackOffset = 1;
-                var maxRepeatedSequenceLength = 0;
+        for (var i = 0; i < source.Length;) {
+            var lookbackOffset = 1;
+            var maxRepeatedSequenceLength = 0;
 
-                for (int index = lastByteIndex[source[i]], remaining = level;
-                     index != -1 && remaining > 0;
-                     index = prevSameByteIndex[index], remaining--) {
-                    var lookbackLength = i - index;
-                    var compareTo = source.Slice(index, lookbackLength);
+            for (int index = lastByteIndex[source[i]], remaining = level;
+                 index != -1 && remaining > 0;
+                 index = prevSameByteIndex[index], remaining--) {
+                var lookbackLength = i - index;
+                var compareTo = source.Slice(index, lookbackLength);
 
-                    var repeatedSequenceLength = 0;
-                    for (var s = source[i..]; !s.IsEmpty; s = s[lookbackLength..]) {
-                        var len = compareTo.CommonPrefixLength(s);
-                        repeatedSequenceLength += len;
-                        if (len < lookbackLength)
-                            break;
-                    }
-
-                    if (repeatedSequenceLength >= maxRepeatedSequenceLength) {
-                        maxRepeatedSequenceLength = repeatedSequenceLength;
-                        lookbackOffset = lookbackLength;
-                    }
+                var repeatedSequenceLength = 0;
+                for (var s = source[i..]; !s.IsEmpty; s = s[lookbackLength..]) {
+                    var len = compareTo.CommonPrefixLength(s);
+                    repeatedSequenceLength += len;
+                    if (len < lookbackLength)
+                        break;
                 }
 
-                if (maxRepeatedSequenceLength >= 3 &&
-                    maxRepeatedSequenceLength >=
-                    (asisLen == 0 ? 0 : CryBinaryPrimitives.CountCryIntBytes(asisLen, false)) +
-                    CryBinaryPrimitives.CountCryIntBytes(maxRepeatedSequenceLength - 3, true) +
-                    CryBinaryPrimitives.CountCryIntBytes(lookbackOffset, false)) {
-                    if (asisLen != 0) {
-                        totalWritten += target.WriteAndHash(
-                            cryIntBuf.AsSpan().WriteCryIntWithFlag(asisLen, false),
-                            ref hash);
-                        totalWritten += target.WriteAndHash(
-                            source.Slice(asisBegin, asisLen),
-                            ref hash);
-                    }
+                if (repeatedSequenceLength >= maxRepeatedSequenceLength) {
+                    maxRepeatedSequenceLength = repeatedSequenceLength;
+                    lookbackOffset = lookbackLength;
+                }
+            }
 
+            if (maxRepeatedSequenceLength >= 3 &&
+                maxRepeatedSequenceLength >=
+                (asisLen == 0 ? 0 : CryBinaryPrimitives.CountCryIntBytes(asisLen, false)) +
+                CryBinaryPrimitives.CountCryIntBytes(maxRepeatedSequenceLength - 3, true) +
+                CryBinaryPrimitives.CountCryIntBytes(lookbackOffset, false)) {
+                if (asisLen != 0) {
                     totalWritten += target.WriteAndHash(
-                        cryIntBuf.AsSpan().WriteCryIntWithFlag(maxRepeatedSequenceLength - 3, true),
+                        cryIntBuf.WriteCryIntWithFlag(asisLen, false),
                         ref hash);
                     totalWritten += target.WriteAndHash(
-                        cryIntBuf.AsSpan().WriteCryInt(lookbackOffset),
+                        source.Slice(asisBegin, asisLen),
                         ref hash);
+                }
 
-                    while (maxRepeatedSequenceLength-- > 0) {
-                        prevSameByteIndex[i] = lastByteIndex[source[i]];
-                        lastByteIndex[source[i]] = i;
+                totalWritten += target.WriteAndHash(
+                    cryIntBuf.WriteCryIntWithFlag(maxRepeatedSequenceLength - 3, true),
+                    ref hash);
+                totalWritten += target.WriteAndHash(
+                    cryIntBuf.WriteCryInt(lookbackOffset),
+                    ref hash);
 
-                        i++;
-                    }
-
-                    asisBegin = i;
-                    asisLen = 0;
-                } else {
+                while (maxRepeatedSequenceLength-- > 0) {
                     prevSameByteIndex[i] = lastByteIndex[source[i]];
                     lastByteIndex[source[i]] = i;
 
-                    asisLen++;
                     i++;
                 }
-            }
 
-            if (asisLen != 0) {
-                totalWritten += target.WriteAndHash(cryIntBuf.AsSpan().WriteCryIntWithFlag(asisLen, false), ref hash);
-                totalWritten += target.WriteAndHash(source.Slice(asisBegin, asisLen), ref hash);
+                asisBegin = i;
+                asisLen = 0;
+            } else {
+                prevSameByteIndex[i] = lastByteIndex[source[i]];
+                lastByteIndex[source[i]] = i;
+
+                asisLen++;
+                i++;
             }
-        } finally {
-            ArrayPool<byte>.Shared.Return(cryIntBuf);
+        }
+
+        if (asisLen != 0) {
+            totalWritten += target.WriteAndHash(cryIntBuf.WriteCryIntWithFlag(asisLen, false), ref hash);
+            totalWritten += target.WriteAndHash(source.Slice(asisBegin, asisLen), ref hash);
         }
 
         crc32 = hash;
