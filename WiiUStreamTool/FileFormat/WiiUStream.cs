@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Collections.Immutable;
 using System.Text;
 using WiiUStreamTool.Util;
 
@@ -6,17 +7,17 @@ namespace WiiUStreamTool.FileFormat;
 
 public static class WiiUStream {
     public const string MetadataFilename = "_WiiUStreamMetadata.txt";
-    public const int Magic = 0x7374726d; // 'strm'
+    public static readonly ImmutableArray<byte> Magic = "strm"u8.ToArray().ToImmutableArray();
 
     public static void Extract(
         Stream stream,
         string basePath,
-        bool decompressXml,
+        bool preservePbxml,
         bool overwrite,
         ExtractProgress? progress) {
         using var reader = new NativeReader(stream, Encoding.UTF8, true) {IsBigEndian = true};
 
-        if (reader.ReadUInt32() != Magic)
+        if (!Magic.SequenceEqual(reader.ReadBytes(4)))
             throw new InvalidDataException("Given file does not have the correct magic value.");
 
         Directory.CreateDirectory(basePath);
@@ -48,7 +49,7 @@ public static class WiiUStream {
             try {
                 using (var target = new FileStream(tempPath, FileMode.Create)) {
                     msr.BaseStream.Position = 0;
-                    if (decompressXml &&
+                    if (!preservePbxml &&
                         ms.Length >= Pbxml.Magic.Length &&
                         ms.GetBuffer().AsSpan().CommonPrefixLength(Pbxml.Magic.AsSpan()) == Pbxml.Magic.Length)
                         Pbxml.Unpack(msr, new(target, new UTF8Encoding()));
@@ -75,7 +76,7 @@ public static class WiiUStream {
     public static void Compress(
         string basePath,
         Stream target,
-        bool packXml,
+        bool preserveXml,
         int compressionLevel,
         CompressProgress progress) {
         FileEntryHeader[] files;
@@ -92,7 +93,7 @@ public static class WiiUStream {
         }
 
         using var writer = new NativeWriter(target, Encoding.UTF8) {IsBigEndian = true};
-        writer.Write(Magic);
+        writer.Write(Magic.AsSpan());
 
         using var sourceBuffer = new MemoryStream();
         using var compressionBuffer = new MemoryStream();
@@ -108,13 +109,7 @@ public static class WiiUStream {
 
             var sourceSpan = sourceBuffer.GetBuffer().AsSpan(0, (int) sourceBuffer.Length);
 
-            if (packXml &&
-                sourceSpan.Length >= 5 &&
-                sourceSpan[0] == '<' &&
-                sourceSpan[1] == '?' &&
-                sourceSpan[2] == 'x' &&
-                sourceSpan[3] == 'm' &&
-                sourceSpan[4] == 'l') {
+            if (!preserveXml && sourceSpan.StartsWith("<?xml"u8)) {
                 compressionBuffer.SetLength(0);
                 compressionBuffer.Position = 0;
                 sourceBuffer.Position = 0;

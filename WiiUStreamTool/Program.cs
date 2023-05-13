@@ -1,31 +1,37 @@
 ﻿using System.CommandLine;
 using WiiUStreamTool.FileFormat;
+using WiiUStreamTool.Util;
 
 namespace WiiUStreamTool;
 
 public static class Program {
-    private static Command GetExtractCommand(Option<bool> overwriteOption) {
-        var cmd = new Command("extract");
-        cmd.AddAlias("e");
+    private static Command GetExtractCommand(Command parentCommand, Option<bool> overwriteOption) {
+        var command = new Command("extract");
+        command.AddAlias("e");
 
         var pathArgument = new Argument<string>("path", "Specify path to a .wiiu.stream archive.");
-        cmd.AddArgument(pathArgument);
+        command.AddArgument(pathArgument);
 
         var outPathOption = new Option<string?>(
             "--out-path",
             () => null,
             "Specify target directory. Defaults to filename without extension.");
         outPathOption.AddAlias("-o");
-        cmd.AddOption(outPathOption);
+        command.AddOption(outPathOption);
 
-        var textXmlOption = new Option<bool>(
-            "--text-xml",
+        var preservePbxmlOption = new Option<bool>(
+            "--preserve-pbxml",
             () => false,
-            "Extract packed binary XML files into text XML file.");
-        textXmlOption.AddAlias("-t");
-        cmd.AddOption(textXmlOption);
+            "Keep packed binary XML files as-is.");
+        preservePbxmlOption.AddAlias("-p");
+        command.AddOption(preservePbxmlOption);
 
-        cmd.SetHandler((path, outPath, textXml, overwrite) => {
+        command.SetHandler(context => {
+            var path = context.ParseResult.GetValueForArgument(pathArgument);
+            var outPath = context.ParseResult.GetValueForOption(outPathOption);
+            var preservePbxml = context.ParseResult.GetValueForOption(preservePbxmlOption);
+            var overwrite = context.ParseResult.GetValueForOption(overwriteOption);
+            
             using var f = File.OpenRead(path);
             outPath ??= Path.Combine(
                 Path.GetDirectoryName(path) ?? Environment.CurrentDirectory,
@@ -33,7 +39,7 @@ public static class Program {
             WiiUStream.Extract(
                 f,
                 outPath,
-                textXml,
+                preservePbxml,
                 overwrite,
                 (ref WiiUStream.FileEntryHeader fe, long progress, long max, bool skipped) => Console.WriteLine(
                     "[{0:00.00}%] {1} ({2:##,###} bytes){3}",
@@ -43,40 +49,47 @@ public static class Program {
                     skipped ? " [SKIPPED]" : ""));
             Console.WriteLine("Done!");
             return Task.FromResult(0);
-        }, pathArgument, outPathOption, textXmlOption, overwriteOption);
+        });
 
-        return cmd;
+        parentCommand.AddCommand(command);
+        return command;
     }
 
-    private static Command GetCompressCommand(Option<bool> overwriteOption) {
-        var cmd = new Command("compress");
-        cmd.AddAlias("c");
+    private static Command GetCompressCommand(Command parentCommand, Option<bool> overwriteOption) {
+        var command = new Command("compress");
+        command.AddAlias("c");
 
         var pathArgument = new Argument<string>("path", "Specify path to a folder to compress.");
-        cmd.AddArgument(pathArgument);
+        command.AddArgument(pathArgument);
 
         var outPathOption = new Option<string?>(
             "--out-path",
             () => null,
             "Specify target path. Defaults to given folder name with .wiiu.stream extension.");
         outPathOption.AddAlias("-o");
-        cmd.AddOption(outPathOption);
+        command.AddOption(outPathOption);
 
-        var packXmlOption = new Option<bool>(
-            "--pack-xml",
+        var preserveXmlOption = new Option<bool>(
+            "--preserve-xml",
             () => false,
-            "Pack XML files into packed binary XML file.");
-        packXmlOption.AddAlias("-p");
-        cmd.AddOption(packXmlOption);
+            "Keep text XML files as-is.");
+        preserveXmlOption.AddAlias("-p");
+        command.AddOption(preserveXmlOption);
 
         var compressionLevelOption = new Option<int>(
             "--compression-level",
             () => 8,
             "Specify the effort for compressing files. Use 0 to disable compression. Time taken scales linearly.");
         compressionLevelOption.AddAlias("-l");
-        cmd.AddOption(compressionLevelOption);
+        command.AddOption(compressionLevelOption);
 
-        cmd.SetHandler((path, outPath, packXml, compressionLevel, overwrite) => {
+        command.SetHandler(context => {
+            var path = context.ParseResult.GetValueForArgument(pathArgument);
+            var outPath = context.ParseResult.GetValueForOption(outPathOption);
+            var preserveXml = context.ParseResult.GetValueForOption(preserveXmlOption);
+            var compressionLevel = context.ParseResult.GetValueForOption(compressionLevelOption);
+            var overwrite = context.ParseResult.GetValueForOption(overwriteOption);
+            
             outPath ??= Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".wiiu.stream");
             if (!overwrite && Path.Exists(outPath)) {
                 Console.Error.WriteLine("File {0} already exists; aborting. Use -y to overwrite.", outPath);
@@ -89,7 +102,7 @@ public static class Program {
                     WiiUStream.Compress(
                         path,
                         stream,
-                        packXml,
+                        preserveXml,
                         compressionLevel,
                         (s, progress, max) => Console.WriteLine(
                             "[{0:00.00}%] {1}",
@@ -111,9 +124,10 @@ public static class Program {
 
                 throw;
             }
-        }, pathArgument, outPathOption, packXmlOption, compressionLevelOption, overwriteOption);
+        });
 
-        return cmd;
+        parentCommand.AddCommand(command);
+        return command;
     }
 
     public static Task<int> Main(string[] args) {
@@ -125,8 +139,32 @@ public static class Program {
             "Overwrite the target file if it exists.");
         overwriteOption.AddAlias("-y");
         cmd.AddGlobalOption(overwriteOption);
-        cmd.AddCommand(GetExtractCommand(overwriteOption));
-        cmd.AddCommand(GetCompressCommand(overwriteOption));
+        var extractCommand = GetExtractCommand(cmd, overwriteOption);
+        var compressCommand = GetCompressCommand(cmd, overwriteOption);
+
+        // Special case when we received 1 argument (excluding application name),
+        // and the second parameter is an existing folder or file.
+        if (args.Length == 1 && !cmd.Subcommands.Any(x => x.Aliases.Contains(args[0])) && Path.Exists(args[0])) {
+            if (Directory.Exists(args[0])) {
+                if (Path.Exists(Path.Combine(args[0], WiiUStream.MetadataFilename))) {
+                    using (ScopedConsoleColor.Foreground(ConsoleColor.Yellow))
+                        Console.WriteLine("Assuming {0} with default options.", compressCommand.Name);
+                    args = new[] {compressCommand.Name, args[0]};
+                }
+                
+            } else if (File.Exists(args[0])) {
+                Span<byte> peekResult = stackalloc byte[Math.Max(WiiUStream.Magic.Length, Pbxml.Magic.Length)];
+                using (var peeker = File.OpenRead(args[0]))
+                    peekResult = peekResult[..peeker.Read(peekResult)];
+
+                if (peekResult.StartsWith(WiiUStream.Magic.AsSpan())) {
+                    using (ScopedConsoleColor.Foreground(ConsoleColor.Yellow))
+                        Console.WriteLine("Assuming {0} with default options.", extractCommand.Name);
+                    args = new[] {extractCommand.Name, args[0]};
+                }
+            }
+        }
+        
         return cmd.InvokeAsync(args);
     }
 }

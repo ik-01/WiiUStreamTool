@@ -5,14 +5,7 @@ using WiiUStreamTool.Util;
 namespace WiiUStreamTool.FileFormat;
 
 public static class Pbxml {
-    public static readonly ImmutableArray<byte> Magic = new byte[] {
-        (byte) 'p',
-        (byte) 'b',
-        (byte) 'x',
-        (byte) 'm',
-        (byte) 'l',
-        0,
-    }.ToImmutableArray();
+    public static readonly ImmutableArray<byte> Magic = "pbxml\0"u8.ToArray().ToImmutableArray();
 
     public static void Unpack(BinaryReader source, StreamWriter target) {
         if (!source.ReadBytes(Magic.Length).SequenceEqual(Magic))
