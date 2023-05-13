@@ -30,22 +30,18 @@ public static class Program {
             outPath ??= Path.Combine(
                 Path.GetDirectoryName(path) ?? Environment.CurrentDirectory,
                 Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(path)));
-            ushort unknownValue = 0;
             WiiUStream.Extract(
                 f,
                 outPath,
                 textXml,
                 overwrite,
-                (ref WiiUStream.FileEntryHeader fe, long progress, long max, bool skipped) => {
-                    unknownValue = fe.Unknown;
-                    Console.WriteLine(
-                        "[{0:00.00}%] {1} ({2:##,###} bytes){3}",
-                        100.0 * progress / max,
-                        fe.InnerPath,
-                        fe.DecompressedSize,
-                        skipped ? " [SKIPPED]" : "");
-                });
-            Console.WriteLine("Done! Unknown value is {0}.", unknownValue);
+                (ref WiiUStream.FileEntryHeader fe, long progress, long max, bool skipped) => Console.WriteLine(
+                    "[{0:00.00}%] {1} ({2:##,###} bytes){3}",
+                    100.0 * progress / max,
+                    fe.InnerPath,
+                    fe.DecompressedSize,
+                    skipped ? " [SKIPPED]" : ""));
+            Console.WriteLine("Done!");
             return Task.FromResult(0);
         }, pathArgument, outPathOption, textXmlOption, overwriteOption);
 

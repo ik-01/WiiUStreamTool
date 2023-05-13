@@ -51,7 +51,7 @@ public static class WiiUStream {
                     if (decompressXml &&
                         ms.Length >= Pbxml.Magic.Length &&
                         ms.GetBuffer().AsSpan().CommonPrefixLength(Pbxml.Magic.AsSpan()) == Pbxml.Magic.Length)
-                        Pbxml.Read(msr, new(target, new UTF8Encoding()));
+                        Pbxml.Unpack(msr, new(target, new UTF8Encoding()));
                     else
                         msr.BaseStream.CopyTo(target);
                 }
@@ -118,7 +118,7 @@ public static class WiiUStream {
                 compressionBuffer.SetLength(0);
                 compressionBuffer.Position = 0;
                 sourceBuffer.Position = 0;
-                Pbxml.Write(sourceBuffer, compressionBufferWriter);
+                Pbxml.Pack(sourceBuffer, compressionBufferWriter);
                 sourceBuffer.SetLength(compressionBuffer.Length);
                 sourceBuffer.Position = 0;
                 compressionBuffer.Position = 0;
