@@ -1,3 +1,5 @@
+### NOTE: All Rise of Lyric tools development moved [here](https://github.com/Soreepeong/SynergyTools)
+
 # WiiUStreamTool
 
 Tool for extracting and repacking Sonic Boom: Rise of Lyric wiiu.stream archives
